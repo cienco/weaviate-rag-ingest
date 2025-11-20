@@ -336,7 +336,7 @@ def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]
         Filter.by_property("isDeleted").equal(False),
     ])
 
-    res = coll.query.fetch_objects(limit=1000, where=where_filter)
+    res = coll.query.fetch_objects(limit=1000, filters=where_filter)
     files: List[Dict[str, Any]] = []
 
     for obj in res.objects:
@@ -362,7 +362,7 @@ def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]
 def mark_file_indexed(client: weaviate.WeaviateClient, source_id: str):
     coll = client.collections.get("FileIndexStatus")
     res = coll.query.fetch_objects(
-        where=Filter.by_property("sourceId").equal(source_id),
+        filters=Filter.by_property("sourceId").equal(source_id),
         limit=1,
     )
     if not res.objects:

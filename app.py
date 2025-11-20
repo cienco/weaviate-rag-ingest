@@ -1,7 +1,8 @@
-import os
 import time
 import threading
-from fastapi import FastAPI
+from typing import Optional
+
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from ingest_pipeline import main as run_ingest
@@ -9,52 +10,35 @@ from ingest_pipeline import main as run_ingest
 
 app = FastAPI(title="Wind Bilance Ingest Worker")
 
-# Flag + lock per evitare ingest sovrapposti
 _ingest_lock = threading.Lock()
-_is_running = False
+_is_running: bool = False
+_last_run_ts: Optional[float] = None
+_last_error: Optional[str] = None
 
 
 def _run_ingest_safe():
-    """
-    Esegue run_ingest() evitando che ci siano più ingest in parallelo.
-    """
-    global _is_running
+    global _is_running, _last_run_ts, _last_error
 
     with _ingest_lock:
         if _is_running:
-            print("[worker] Ingest già in esecuzione, salto.")
+            print("[worker] Ingest già in esecuzione, non ne avvio un altro.")
             return
         _is_running = True
 
     try:
-        print("[worker] >>> Avvio ingest manuale/background")
+        print("[worker] >>> Avvio ingest")
         start = time.time()
         run_ingest()
         elapsed = time.time() - start
         print(f"[worker] <<< Ingest completato in {elapsed:.1f}s")
+        _last_run_ts = time.time()
+        _last_error = None
     except Exception as e:
         print("[worker] ERRORE in ingest:", repr(e))
+        _last_error = repr(e)
     finally:
         with _ingest_lock:
             _is_running = False
-
-
-def _background_loop():
-    """
-    Loop che esegue ingest periodico ogni N secondi.
-    """
-    interval_str = os.getenv("INGEST_INTERVAL_SECONDS", "600")  # default 10 minuti
-    try:
-        interval = int(interval_str)
-    except ValueError:
-        interval = 600
-
-    print(f"[worker] Loop ingest attivo – intervallo = {interval} secondi")
-
-    while True:
-        _run_ingest_safe()
-        print(f"[worker] Sleep per {interval} secondi")
-        time.sleep(interval)
 
 
 @app.get("/")
@@ -62,48 +46,28 @@ def root():
     return {"status": "ok", "message": "Wind Bilance ingest worker"}
 
 
-@app.on_event("startup")
-def on_startup():
-    """
-    Avviato all'avvio del processo: parte il thread di background.
-    """
-    t = threading.Thread(target=_background_loop, daemon=True)
-    t.start()
-    print("[worker] Thread di background avviato.")
-
-
-@app.get("/healthz")
-def health():
-    """
-    Endpoint di health check (utile per Render).
-    """
-    return {"status": "ok"}
+@app.get("/status")
+def status():
+    return {
+        "running": _is_running,
+        "last_run_ts": _last_run_ts,
+        "last_error": _last_error,
+    }
 
 
 @app.post("/ingest")
-def ingest_manual():
+def ingest(background_tasks: BackgroundTasks):
     """
-    Forza un ingest manuale:
-    - se non c'è ingest in corso → parte subito in un thread separato
-    - se c'è ingest in corso → ritorna 409 (conflitto)
+    Avvia un ingest in background, se non ce n'è già uno in corso.
     """
-    global _is_running
-
     with _ingest_lock:
         if _is_running:
+            # Non è un errore: semplicemente c'è già un ingest in corso
             return JSONResponse(
-                status_code=409,
-                content={"status": "busy", "detail": "Ingest già in esecuzione"},
+                status_code=200,
+                content={"status": "already_running", "detail": "Ingest già in esecuzione"},
             )
 
-        # Lancia ingest in un thread separato
-        t = threading.Thread(target=_run_ingest_safe, daemon=True)
-        t.start()
-
-    return {"status": "started", "detail": "Ingest avviato"}
-
-
-# opzionale: endpoint GET /ingest per comodità da browser
-@app.get("/ingest")
-def ingest_manual_get():
-    return ingest_manual()
+        # Avvio ingest in background
+        background_tasks.add_task(_run_ingest_safe)
+        return {"status": "started", "detail": "Ingest avviato"}

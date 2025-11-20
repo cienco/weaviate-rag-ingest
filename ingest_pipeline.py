@@ -60,7 +60,10 @@ SA_PATH = "/tmp/gcp-sa.json"
 with open(SA_PATH, "w") as f:
     f.write(GCP_SA_JSON)
 
-SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+SCOPES = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 base_creds = service_account.Credentials.from_service_account_file(
     SA_PATH,

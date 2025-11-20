@@ -57,6 +57,11 @@ def _background_loop():
         time.sleep(interval)
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Wind Bilance ingest worker"}
+
+
 @app.on_event("startup")
 def on_startup():
     """

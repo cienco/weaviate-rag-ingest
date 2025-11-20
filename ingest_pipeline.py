@@ -122,12 +122,13 @@ def chunk_text(text: str, max_chars: int = MAX_TEXT_CHARS) -> List[str]:
 # =============================================================================
 
 def get_weaviate_client() -> weaviate.WeaviateClient:
+    """
+    Connessione a Weaviate Cloud usando SOLO l'API key del cluster.
+    Niente header Authorization custom (quello lo gestisce il client per WCS).
+    """
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WCS_URL,
         auth_credentials=Auth.api_key(WCS_API_KEY),
-        headers={
-            "Authorization": f"Bearer {vertex_token}",
-        },
     )
     return client
 

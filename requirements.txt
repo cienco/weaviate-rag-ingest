@@ -1,1 +1,10 @@
 weaviate-client
+pdf2image
+pymupdf
+python-docx
+pandas
+openpyxl
+google-cloud-documentai
+google-auth
+google-auth-httplib2
+google-auth-oauthlib

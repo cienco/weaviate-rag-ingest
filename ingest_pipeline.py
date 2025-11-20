@@ -23,6 +23,10 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.cloud import documentai_v1 as documentai
 
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+
 # =============================================================================
 # CONFIGURAZIONE DA ENV VAR
 # =============================================================================
@@ -75,6 +79,28 @@ IGNORED_TYPES = {"zip", "sql", "doc", "msg"}
 
 # Limite di caratteri per il campo text del multimodal embedding
 MAX_TEXT_CHARS = 900
+
+
+# =============================================================================
+# GOOGLE DRIVE CONFIG
+# =============================================================================
+
+# ID della cartella root su Google Drive da cui leggere TUTTI i file Wind Bilance
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
+if not GDRIVE_FOLDER_ID:
+    raise RuntimeError("GDRIVE_FOLDER_ID non è settata: serve l'ID della cartella su Google Drive.")
+
+_drive_service = None
+
+
+def get_drive_service():
+    """
+    Client Google Drive v3 riusando le stesse credenziali (base_creds).
+    """
+    global _drive_service
+    if _drive_service is None:
+        _drive_service = build("drive", "v3", credentials=base_creds)
+    return _drive_service
 
 
 # =============================================================================
@@ -197,44 +223,78 @@ class SourceFile:
 
 def list_source_files() -> List[SourceFile]:
     """
-    Legge tutti i file da SOURCE_BASE_DIR.
+    Legge tutti i file da una cartella di Google Drive (e sotto-cartelle),
+    usando GDRIVE_FOLDER_ID come root.
     """
-    base_dir = SOURCE_BASE_DIR
+    service = get_drive_service()
+    root_id = GDRIVE_FOLDER_ID
     files: List[SourceFile] = []
 
-    if not os.path.isdir(base_dir):
-        print(f"[source] WARNING: directory sorgente non esiste: {base_dir}")
-        return files
+    # BFS sulle cartelle di Drive: (prefix_path, folder_id)
+    queue: List[tuple[str, str]] = [("", root_id)]
 
-    for root, dirs, filenames in os.walk(base_dir):
-        for fname in filenames:
-            full_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(full_path, base_dir)
-            rel_path_posix = rel_path.replace("\\", "/")
+    while queue:
+        path_prefix, folder_id = queue.pop(0)
 
-            stat = os.stat(full_path)
-            last_modified_dt = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-            last_modified = last_modified_dt.isoformat()
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)",
+                pageToken=page_token,
+            ).execute()
 
-            files.append(
-                SourceFile(
-                    id=rel_path_posix,
-                    name=fname,
-                    path=rel_path_posix,
-                    url="",
-                    last_modified=last_modified,
+            for item in resp.get("files", []):
+                mime = item.get("mimeType")
+                fid = item["id"]
+                name = item["name"]
+
+                # Sottocartella → metti in coda
+                if mime == "application/vnd.google-apps.folder":
+                    new_prefix = f"{path_prefix}{name}/"
+                    queue.append((new_prefix, fid))
+                    continue
+
+                # File "normale"
+                rel_path = f"{path_prefix}{name}"
+                last_modified = item.get("modifiedTime")  # ISO 8601 già ok per Weaviate
+                url = item.get("webViewLink", "")
+
+                files.append(
+                    SourceFile(
+                        id=fid,                # sourceId = fileId di Drive
+                        name=name,
+                        path=rel_path,         # path logico es: "subdir/file.pdf"
+                        url=url,
+                        last_modified=last_modified,
+                    )
                 )
-            )
 
-    print(f"[source] Trovati {len(files)} file in {base_dir}")
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    print(f"[source] Trovati {len(files)} file in Google Drive (root={root_id})")
     return files
 
 
 def download_source_file(file_meta: Dict[str, Any]) -> bytes:
-    rel_path = file_meta["path"]
-    full_path = os.path.join(SOURCE_BASE_DIR, rel_path)
-    with open(full_path, "rb") as f:
-        return f.read()
+    """
+    Scarica il file da Google Drive usando sourceId come fileId.
+    """
+    service = get_drive_service()
+    file_id = file_meta["sourceId"]
+
+    request = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+        # Se vuoi puoi loggare: print("Download %d%%" % int(status.progress() * 100))
+
+    return buf.getvalue()
 
 
 # =============================================================================

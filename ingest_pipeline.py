@@ -2,7 +2,7 @@ import os
 import io
 import base64
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import weaviate
 from weaviate.classes.init import Auth
@@ -373,6 +373,34 @@ def run_ocr_on_image_bytes(image_bytes: bytes) -> str:
 # FILEINDEXSTATUS: SYNC, QUERY, UPDATE
 # =============================================================================
 
+def fetch_all_fileindexstatus(
+    coll,
+    filters: Optional[Any] = None,
+    page_size: int = 200,
+):
+    """
+    Recupera TUTTI gli oggetti di FileIndexStatus paginando con offset.
+    """
+    all_objs = []
+    offset = 0
+
+    while True:
+        res = coll.query.fetch_objects(
+            limit=page_size,
+            offset=offset,
+            filters=filters,
+        )
+        if not res.objects:
+            break
+
+        all_objs.extend(res.objects)
+        offset += page_size
+
+        print(f"[fileindex] Fetched {len(all_objs)} FileIndexStatus objects finora...")
+
+    return all_objs
+
+
 def sync_source_to_fileindex(client: weaviate.WeaviateClient):
     """
     Sincronizza SourceFile -> FileIndexStatus.
@@ -380,9 +408,11 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
     coll = client.collections.get("FileIndexStatus")
 
     existing: Dict[str, Any] = {}
-    res = coll.query.fetch_objects(limit=1000)
-    for obj in res.objects:
-        sid = obj.properties.get("sourceId")
+    existing_objs = fetch_all_fileindexstatus(coll)
+
+    for obj in existing_objs:
+        props = obj.properties or {}
+        sid = props.get("sourceId")
         if sid:
             existing[sid] = obj
 
@@ -432,32 +462,28 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
 
 
 def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]]:
+    """
+    Prende TUTTI i file da FileIndexStatus (paginando) e tiene solo i tipi indicizzabili.
+    Per ora ignoriamo indexedAt/isDeleted per fare un full ingest iniziale.
+    """
     coll = client.collections.get("FileIndexStatus")
 
-    where_filter = Filter.all_of([
-        Filter.by_property("isDeleted").equal(False),
-    ])
+    # Nessun filtro, prendiamo tutti e filtriamo in Python
+    objs = fetch_all_fileindexstatus(coll)
 
-    res = coll.query.fetch_objects(limit=1000, filters=where_filter)
     files: List[Dict[str, Any]] = []
+    print(f"[list_files_to_ingest] Oggetti FileIndexStatus letti: {len(objs)}")
 
-    for obj in res.objects:
-        props = obj.properties
+    for obj in objs:
+        props = obj.properties or {}
         file_type = (props.get("fileType") or "").lower()
 
         if file_type not in INDEXABLE_TYPES:
             continue
 
-        last_mod = parse_iso(props.get("lastModified"))
-        indexed_at = parse_iso(props.get("indexedAt"))
+        files.append(props)
 
-        if indexed_at is None:
-            files.append(props)
-            continue
-
-        if last_mod and last_mod > indexed_at:
-            files.append(props)
-
+    print(f"[list_files_to_ingest] File da ingestare (tipi supportati): {len(files)}")
     return files
 
 

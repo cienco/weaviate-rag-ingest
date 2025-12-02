@@ -496,18 +496,15 @@ def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]
     Seleziona i file da ingestare a partire da FileIndexStatus.
 
     Criteri:
-    - isDeleted != True
+    - isDeleted == False
     - fileType in INDEXABLE_TYPES
     - indexedAt mancante  -> da ingestare
     - OPPURE lastModified > indexedAt -> da re-ingestare
     """
     coll = client.collections.get("FileIndexStatus")
 
-    # Filtra già lato Weaviate per isDeleted != True
-    where = Filter.any_of([
-        Filter.by_property("isDeleted").equal(False),
-        Filter.by_property("isDeleted").is_null(),
-    ])
+    # Filtra lato Weaviate per isDeleted == False
+    where = Filter.by_property("isDeleted").equal(False)
 
     objs = fetch_all_fileindexstatus(coll, filters=where)
     print(f"[list_files_to_ingest] Oggetti FileIndexStatus letti (non deleted): {len(objs)}")

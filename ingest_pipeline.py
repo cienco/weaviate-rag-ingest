@@ -51,19 +51,24 @@ DOCAI_PROCESSOR_ID = os.getenv("DOCAI_PROCESSOR_ID")
 if not DOCAI_PROCESSOR_ID:
     raise RuntimeError("DOCAI_PROCESSOR_ID deve essere settata nelle env vars.")
 
-# Service Account JSON (contenuto completo della chiave) passato via env
-GCP_SA_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-if not GCP_SA_JSON:
-    raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON deve contenere il JSON della service account.")
-
-SA_PATH = "/tmp/gcp-sa.json"
-with open(SA_PATH, "w") as f:
-    f.write(GCP_SA_JSON)
-
+# Scopes per Document AI + Drive
 SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
+
+# Percorso del file JSON della service account
+# pattern compatibile con il tuo MCP:
+SA_PATH = (
+    os.getenv("VERTEX_SA_PATH")
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    or "/etc/secrets/weaviate-sa.json"
+)
+
+if not os.path.exists(SA_PATH):
+    raise RuntimeError(f"Service account non trovata: {SA_PATH}")
+
+print(f"[config] Uso service account da: {SA_PATH}")
 
 base_creds = service_account.Credentials.from_service_account_file(
     SA_PATH,

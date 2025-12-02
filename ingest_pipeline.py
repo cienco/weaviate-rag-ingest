@@ -410,13 +410,19 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
             props["note"] = ""
 
         if source_id in existing:
-            coll.data.update(id=existing[source_id].uuid, properties=props)
+            coll.data.update(
+                uuid=existing[source_id].uuid,
+                properties=props,
+            )
         else:
             coll.data.insert(properties=props)
 
     for sid, obj in existing.items():
         if sid not in seen_ids:
-            coll.data.update(id=obj.uuid, properties={"isDeleted": True})
+            coll.data.update(
+                uuid=obj.uuid,
+                properties={"isDeleted": True},
+            )
 
 
 def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]]:
@@ -459,8 +465,8 @@ def mark_file_indexed(client: weaviate.WeaviateClient, source_id: str):
         return
     obj = res.objects[0]
     coll.data.update(
-        id=obj.uuid,
-        properties={"indexedAt": now_iso_utc()}
+        uuid=obj.uuid,
+        properties={"indexedAt": now_iso_utc()},
     )
 
 

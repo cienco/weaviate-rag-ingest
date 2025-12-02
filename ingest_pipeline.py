@@ -506,16 +506,19 @@ def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]
     # Filtra lato Weaviate per isDeleted == False
     where = Filter.by_property("isDeleted").equal(False)
 
+    print("[list_files_to_ingest] Faccio fetch di tutti i FileIndexStatus non deleted...")
     objs = fetch_all_fileindexstatus(coll, filters=where)
     print(f"[list_files_to_ingest] Oggetti FileIndexStatus letti (non deleted): {len(objs)}")
 
     files: List[Dict[str, Any]] = []
+    skipped_not_indexable = 0
 
     for obj in objs:
         props = obj.properties or {}
         file_type = (props.get("fileType") or "").lower()
 
         if file_type not in INDEXABLE_TYPES:
+            skipped_not_indexable += 1
             continue
 
         last_mod = parse_iso(props.get("lastModified"))
@@ -535,27 +538,31 @@ def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]
             files.append(props)
 
     print(f"[list_files_to_ingest] File da ingestare (nuovi/modificati): {len(files)}")
+    print(f"[list_files_to_ingest] File saltati perché non indicizzabili (tipo non supportato): {skipped_not_indexable}")
     return files
 
 
 def mark_file_indexed(client: weaviate.WeaviateClient, source_id: str):
     coll = client.collections.get("FileIndexStatus")
+    print(f"[mark_file_indexed] Cerco FileIndexStatus per sourceId={source_id}")
     res = coll.query.fetch_objects(
         filters=Filter.by_property("sourceId").equal(source_id),
         limit=1,
     )
     if not res.objects:
-        print(f"[mark_file_indexed] Nessun FileIndexStatus trovato per sourceId={source_id}")
+        print(f"[mark_file_indexed][WARN] Nessun FileIndexStatus trovato per sourceId={source_id}")
         return
 
     obj = res.objects[0]
+    ts = now_iso_utc()
     coll.data.update(
         uuid=obj.uuid,
         properties={
-            "indexedAt": now_iso_utc(),
+            "indexedAt": ts,
             "isDeleted": False,
         },
     )
+    print(f"[mark_file_indexed] Aggiornato indexedAt={ts} per sourceId={source_id}, uuid={obj.uuid}")
 
 
 # =============================================================================
@@ -585,28 +592,54 @@ def ingest_pdf(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     file_name = file_meta["name"]
     file_url = file_meta["url"]
 
-    print(f"[ingest_pdf] Inizio ingest {file_name} ({source_id})")
+    print(f"[ingest_pdf] Inizio ingest PDF: {file_name} ({source_id})")
 
     pdf_bytes = download_source_file(file_meta)
+    print(f"[ingest_pdf] PDF scaricato, size={len(pdf_bytes)} bytes")
 
-    pages = convert_from_bytes(pdf_bytes, dpi=200)
+    # 1) testo nativo con PyMuPDF
     native_text_pages = extract_native_text_by_page(pdf_bytes)
+    print(f"[ingest_pdf] Numero pagine (testo nativo): {len(native_text_pages)}")
+
+    # 2) immagini pagine con pdf2image
+    pages = convert_from_bytes(pdf_bytes, dpi=200)
+    print(f"[ingest_pdf] Immagini generate: {len(pages)}")
 
     coll = client.collections.get("WindChunk")
+    total_chunks = 0
 
     for page_index, page_img in enumerate(pages, start=1):
-        img_bytes = page_img_to_bytes(page_img)
-        image_b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-        ocr_text = run_ocr_on_image_bytes(img_bytes)
-
         native_text = ""
         if page_index - 1 < len(native_text_pages):
             native_text = native_text_pages[page_index - 1] or ""
 
-        combined_text = (native_text + "\n" + ocr_text).strip()
-        chunks = chunk_text(combined_text) if combined_text else [""]
+        if len(native_text.strip()) > 0:
+            print(f"[ingest_pdf] Pagina {page_index}: testo nativo len={len(native_text)}")
+        else:
+            print(f"[ingest_pdf] Pagina {page_index}: nessun testo nativo, uso solo OCR")
 
+        # OCR con Document AI
+        img_bytes = page_img_to_bytes(page_img)
+        print(f"[ingest_pdf] Pagina {page_index}: immagine PNG size={len(img_bytes)} bytes")
+
+        ocr_text = ""
+        try:
+            ocr_text = run_ocr_on_image_bytes(img_bytes)
+            print(f"[ingest_pdf] Pagina {page_index}: OCR len={len(ocr_text)}")
+        except Exception as e:
+            print(f"[ingest_pdf][WARN] OCR fallito per pagina {page_index} di {file_name}: {repr(e)}")
+
+        combined_text = (native_text + "\n" + ocr_text).strip()
+        if not combined_text:
+            print(f"[ingest_pdf] Pagina {page_index}: nessun testo combinato, skip")
+            continue
+
+        # Chunking testo
+        chunks = chunk_text(combined_text) if combined_text else [""]
+        print(f"[ingest_pdf] Pagina {page_index}: numero chunk={len(chunks)}")
+
+        # Insert su WindChunk
+        image_b64 = base64.b64encode(img_bytes).decode("utf-8")
         for idx, chunk in enumerate(chunks):
             props = {
                 "sourceId":   source_id,
@@ -620,8 +653,9 @@ def ingest_pdf(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
                 "url":        file_url,
             }
             coll.data.insert(properties=props)
+            total_chunks += 1
 
-    print(f"[ingest_pdf] Fine ingest {file_name}: {len(pages)} pagine indicizzate")
+    print(f"[ingest_pdf] Fine ingest PDF: {file_name}, total_chunks={total_chunks}")
 
 
 def ingest_docx(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
@@ -775,27 +809,39 @@ def ingest_xls(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
 
 def ingest_single_file(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     source_id = file_meta["sourceId"]
+    name = file_meta.get("name")
     file_type = (file_meta.get("fileType") or "").lower()
 
-    print(f"[ingest] File: {file_meta['name']} ({source_id}), type={file_type}")
+    print(f"[ingest_single_file] Inizio per sourceId={source_id}, name={name}, type={file_type}")
 
-    delete_windchunks_for_file(client, source_id)
+    try:
+        delete_windchunks_for_file(client, source_id)
 
-    if file_type == "pdf":
-        ingest_pdf(client, file_meta)
-    elif file_type == "docx":
-        ingest_docx(client, file_meta)
-    elif file_type == "txt":
-        ingest_txt(client, file_meta)
-    elif file_type in {"png", "tif"}:
-        ingest_image(client, file_meta)
-    elif file_type == "xls":
-        ingest_xls(client, file_meta)
-    else:
-        print(f"[ingest] Tipo non gestito (ignorato): {file_type}")
-        return
+        if file_type == "pdf":
+            print(f"[ingest_single_file] -> ingest_pdf per {name}")
+            ingest_pdf(client, file_meta)
+        elif file_type == "docx":
+            print(f"[ingest_single_file] -> ingest_docx per {name}")
+            ingest_docx(client, file_meta)
+        elif file_type == "txt":
+            print(f"[ingest_single_file] -> ingest_txt per {name}")
+            ingest_txt(client, file_meta)
+        elif file_type in {"png", "tif"}:
+            print(f"[ingest_single_file] -> ingest_image per {name}")
+            ingest_image(client, file_meta)
+        elif file_type == "xls":
+            print(f"[ingest_single_file] -> ingest_xls per {name}")
+            ingest_xls(client, file_meta)
+        else:
+            print(f"[ingest_single_file] Tipo file NON gestito: {file_type}, name={name}")
+            return
 
-    mark_file_indexed(client, source_id)
+        print(f"[ingest_single_file] Chiamo mark_file_indexed per sourceId={source_id}")
+        mark_file_indexed(client, source_id)
+        print(f"[ingest_single_file] Fine ingest_single_file per {name}")
+    except Exception as e:
+        print(f"[ingest_single_file][ERROR] Errore durante ingest di {name} ({source_id}): {repr(e)}")
+        raise
 
 
 # =============================================================================
@@ -803,19 +849,27 @@ def ingest_single_file(client: weaviate.WeaviateClient, file_meta: Dict[str, Any
 # =============================================================================
 
 def main():
+    run_id = now_iso_utc()
+    print(f"[main] ===== Avvio run ingest {run_id} =====")
+
     client = get_weaviate_client()
+    print("[main] Client Weaviate creato.")
+
     try:
+        print("[main] Creo/verifico schema Weaviate...")
         create_schema_if_needed(client)
+        print("[main] Schema ok.")
 
-        # 1) Sync Drive -> FileIndexStatus
+        print("[main] Sync Drive -> FileIndexStatus...")
         sync_source_to_fileindex(client)
+        print("[main] Sync completata.")
 
-        # 2) Seleziona file da ingestare (nuovi/modificati)
+        print("[main] Calcolo lista file da ingestare...")
         files = list_files_to_ingest(client)
         print(f"[main] File da ingest (prima del limite): {len(files)}")
 
-        # 3) Applica un limite per run per non esplodere la memoria
-        max_files_str = os.getenv("INGEST_MAX_FILES_PER_RUN", "5")  # DEFAULT: 5
+        # Limite per run per non sforare memoria
+        max_files_str = os.getenv("INGEST_MAX_FILES_PER_RUN", "5")  # es: 5
         try:
             max_files = int(max_files_str)
         except ValueError:
@@ -827,15 +881,22 @@ def main():
 
         print(f"[main] File da ingest effettivi in questo run: {len(files)}")
 
-        # 4) Ingest
-        for fm in files:
+        # Esecuzione ingest
+        for idx, fm in enumerate(files, start=1):
+            name = fm.get("name")
+            source_id = fm.get("sourceId")
+            ftype = fm.get("fileType")
+            print(f"[main] >>> [{idx}/{len(files)}] Inizio ingest file: name={name}, type={ftype}, sourceId={source_id}")
+
             try:
                 ingest_single_file(client, fm)
+                print(f"[main] <<< [{idx}/{len(files)}] Ingest COMPLETATA per: {name}")
             except Exception as e:
-                print(f"[ERROR] Ingest fallito per {fm.get('name')} ({fm.get('sourceId')}): {e}")
+                print(f"[main][ERROR] Ingest FALLITA per {name} ({source_id}): {repr(e)}")
 
-        print("[main] Ingest completato.")
+        print(f"[main] Run ingest {run_id} completato.")
     finally:
         client.close()
         print("[main] Client Weaviate chiuso.")
+        print(f"[main] ===== Fine run ingest {run_id} =====")
 # placeholder ingest_pipeline.py - use content from chat

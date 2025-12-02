@@ -807,10 +807,27 @@ def main():
     try:
         create_schema_if_needed(client)
 
+        # 1) Sync Drive -> FileIndexStatus
         sync_source_to_fileindex(client)
-        files = list_files_to_ingest(client)
-        print(f"[main] File da ingest: {len(files)}")
 
+        # 2) Seleziona file da ingestare (nuovi/modificati)
+        files = list_files_to_ingest(client)
+        print(f"[main] File da ingest (prima del limite): {len(files)}")
+
+        # 3) Applica un limite per run per non esplodere la memoria
+        max_files_str = os.getenv("INGEST_MAX_FILES_PER_RUN", "5")  # DEFAULT: 5
+        try:
+            max_files = int(max_files_str)
+        except ValueError:
+            max_files = 5
+
+        if len(files) > max_files:
+            print(f"[main] Limito ingest a {max_files} file per run (su {len(files)} candidati)")
+            files = files[:max_files]
+
+        print(f"[main] File da ingest effettivi in questo run: {len(files)}")
+
+        # 4) Ingest
         for fm in files:
             try:
                 ingest_single_file(client, fm)

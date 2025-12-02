@@ -117,21 +117,29 @@ def get_drive_service():
 # HELPER GENERALI
 # =============================================================================
 
-def normalize_ext(filename: str) -> str:
-    ext = os.path.splitext(filename)[1].lower()
-    if ext.startswith("."):
-        ext = ext[1:]
-    return ext
+def normalize_ext(name: str) -> str:
+    """
+    Estrae l'estensione in minuscolo senza punto. Es: 'foo.PDF' -> 'pdf'
+    """
+    import os
+    _, ext = os.path.splitext(name)
+    return ext.lower().lstrip(".")
 
 
-def parse_iso(dt_str: str | None):
+def parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
-    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    try:
+        # Gestisce anche ...Z
+        if dt_str.endswith("Z"):
+            dt_str = dt_str[:-1] + "+00:00"
+        return datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def now_iso_utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def page_img_to_bytes(page_img) -> bytes:
@@ -403,21 +411,40 @@ def fetch_all_fileindexstatus(
 
 def sync_source_to_fileindex(client: weaviate.WeaviateClient):
     """
-    Sincronizza SourceFile -> FileIndexStatus.
+    Sincronizza il contenuto di Google Drive con FileIndexStatus in modo idempotente.
+
+    - Legge TUTTI gli oggetti esistenti da FileIndexStatus (paginando)
+    - Li indicizza per sourceId
+    - Per ogni file di Drive:
+      - se sourceId già presente -> UPDATE
+      - se non presente -> INSERT
+    - Marca isDeleted=True per gli oggetti che non sono più presenti in Drive
     """
     coll = client.collections.get("FileIndexStatus")
 
-    existing: Dict[str, Any] = {}
+    # 1) Carico TUTTO il pre-esistente
+    existing_by_source: dict[str, Any] = {}
     existing_objs = fetch_all_fileindexstatus(coll)
 
     for obj in existing_objs:
         props = obj.properties or {}
         sid = props.get("sourceId")
-        if sid:
-            existing[sid] = obj
+        if not sid:
+            continue
 
+        if sid in existing_by_source:
+            # Se per qualche motivo dovessero esistere duplicati, non ne creiamo altri
+            print(f"[sync] WARN: duplicato pre-esistente di sourceId={sid}, uuid={obj.uuid}")
+        else:
+            existing_by_source[sid] = obj
+
+    print(f"[sync] FileIndexStatus esistenti (unici per sourceId): {len(existing_by_source)}")
+
+    # 2) File da sorgente (Google Drive)
     src_files = list_source_files()
-    seen_ids = set()
+    print(f"[sync] File trovati in Drive: {len(src_files)}")
+
+    seen_ids: set[str] = set()
 
     for idx, sf in enumerate(src_files, start=1):
         source_id = sf.id
@@ -431,7 +458,8 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
             "path":         sf.path,
             "url":          sf.url,
             "fileType":     file_type,
-            "lastModified": sf.last_modified,
+            "lastModified": sf.last_modified,  # stringa ISO da Drive
+            "isDeleted":    False,
         }
 
         if file_type in IGNORED_TYPES:
@@ -439,40 +467,52 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
         else:
             props["note"] = ""
 
-        if source_id in existing:
+        if source_id in existing_by_source:
+            # UPDATE idempotente
             coll.data.update(
-                uuid=existing[source_id].uuid,
+                uuid=existing_by_source[source_id].uuid,
                 properties=props,
             )
         else:
+            # INSERT solo se non esiste già
             coll.data.insert(properties=props)
 
-        # LOG OGNI 100 FILE
         if idx % 100 == 0:
             print(f"[sync] Processati {idx}/{len(src_files)} file da Drive")
 
-    print(f"[sync] Sync completata: {len(src_files)} file visti, {len(existing)} già esistenti")
-
-    for sid, obj in existing.items():
+    # 3) (opzionale ma utile) marca come deleted quelli non più visti
+    for sid, obj in existing_by_source.items():
         if sid not in seen_ids:
             coll.data.update(
                 uuid=obj.uuid,
                 properties={"isDeleted": True},
             )
 
+    print(f"[sync] Sync completata: {len(src_files)} file da Drive gestiti.")
+
 
 def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]]:
     """
-    Prende TUTTI i file da FileIndexStatus (paginando) e tiene solo i tipi indicizzabili.
-    Per ora ignoriamo indexedAt/isDeleted per fare un full ingest iniziale.
+    Seleziona i file da ingestare a partire da FileIndexStatus.
+
+    Criteri:
+    - isDeleted != True
+    - fileType in INDEXABLE_TYPES
+    - indexedAt mancante  -> da ingestare
+    - OPPURE lastModified > indexedAt -> da re-ingestare
     """
     coll = client.collections.get("FileIndexStatus")
 
-    # Nessun filtro, prendiamo tutti e filtriamo in Python
-    objs = fetch_all_fileindexstatus(coll)
+    # Filtra già lato Weaviate per isDeleted != True
+    where = Filter.any_of([
+        Filter.by_property("isDeleted").equal(False),
+        Filter.by_property("isDeleted").is_null(),
+    ])
+
+    objs = fetch_all_fileindexstatus(coll, filters=where)
+    print(f"[list_files_to_ingest] Oggetti FileIndexStatus letti (non deleted): {len(objs)}")
 
     files: List[Dict[str, Any]] = []
-    print(f"[list_files_to_ingest] Oggetti FileIndexStatus letti: {len(objs)}")
 
     for obj in objs:
         props = obj.properties or {}
@@ -481,9 +521,23 @@ def list_files_to_ingest(client: weaviate.WeaviateClient) -> List[Dict[str, Any]
         if file_type not in INDEXABLE_TYPES:
             continue
 
-        files.append(props)
+        last_mod = parse_iso(props.get("lastModified"))
+        indexed_at = parse_iso(props.get("indexedAt"))
 
-    print(f"[list_files_to_ingest] File da ingestare (tipi supportati): {len(files)}")
+        # Mai indicizzato -> da ingestare
+        if indexed_at is None:
+            files.append(props)
+            continue
+
+        # Se non abbiamo lastModified, per sicurezza non ingestiamo di nuovo
+        if last_mod is None:
+            continue
+
+        # Modificato dopo l'ultimo ingest -> re-ingest
+        if last_mod > indexed_at:
+            files.append(props)
+
+    print(f"[list_files_to_ingest] File da ingestare (nuovi/modificati): {len(files)}")
     return files
 
 
@@ -494,11 +548,16 @@ def mark_file_indexed(client: weaviate.WeaviateClient, source_id: str):
         limit=1,
     )
     if not res.objects:
+        print(f"[mark_file_indexed] Nessun FileIndexStatus trovato per sourceId={source_id}")
         return
+
     obj = res.objects[0]
     coll.data.update(
         uuid=obj.uuid,
-        properties={"indexedAt": now_iso_utc()},
+        properties={
+            "indexedAt": now_iso_utc(),
+            "isDeleted": False,
+        },
     )
 
 

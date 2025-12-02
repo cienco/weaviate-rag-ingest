@@ -10,7 +10,6 @@ from weaviate.classes.config import (
     Property,
     DataType,
     Configure,
-    Multi2VecField,
 )
 from weaviate.classes.query import Filter
 
@@ -181,49 +180,46 @@ def create_schema_if_needed(client: weaviate.WeaviateClient):
     """
     Crea le collection FileIndexStatus e WindChunk se non esistono.
     """
-    existing = set(client.collections.list_all())
+    existing = {c.name for c in client.collections.list_all()}
 
-    # FileIndexStatus (non vettoriale)
+    # FileIndexStatus (metadati, non vettoriale)
     if "FileIndexStatus" not in existing:
         client.collections.create(
             name="FileIndexStatus",
-            vectorizer_config=Configure.Vectorizer.none(),
             properties=[
-                Property(name="sourceId",     data_type=DataType.TEXT),
-                Property(name="name",         data_type=DataType.TEXT),
-                Property(name="path",         data_type=DataType.TEXT),
-                Property(name="url",          data_type=DataType.TEXT),
-                Property(name="fileType",     data_type=DataType.TEXT),
-                Property(name="lastModified", data_type=DataType.DATE),
-                Property(name="indexedAt",    data_type=DataType.DATE),
-                Property(name="isDeleted",    data_type=DataType.BOOL),
-                Property(name="note",         data_type=DataType.TEXT),
+                Property("sourceId", DataType.TEXT, description="ID sorgente (es: fileId Drive)"),
+                Property("name", DataType.TEXT),
+                Property("path", DataType.TEXT),
+                Property("url", DataType.TEXT),
+                Property("fileType", DataType.TEXT),
+                Property("lastModified", DataType.TEXT),
+                Property("indexedAt", DataType.TEXT),
+                Property("isDeleted", DataType.BOOL),
+                Property("note", DataType.TEXT),
             ],
+            vectorizer_config=Configure.Vectorizer.none(),  # niente embedding
         )
+        print("[schema] Creata collection FileIndexStatus")
 
-    # WindChunk (multimodale)
+    # WindChunk: SOLO TESTO, text2vec-google
     if "WindChunk" not in existing:
         client.collections.create(
             name="WindChunk",
-            vectorizer_config=Configure.Vectorizer.multi2vec_google(
-                project_id=GCP_PROJECT_ID,
-                location=VERTEX_LOCATION,
-                model_id="multimodalembedding@001",
-                image_fields=[Multi2VecField(name="image_b64", weight=0.4)],
-                text_fields=[Multi2VecField(name="text",      weight=0.6)],
-            ),
             properties=[
-                Property(name="sourceId",  data_type=DataType.TEXT),
-                Property(name="fileName",  data_type=DataType.TEXT),
-                Property(name="fileType",  data_type=DataType.TEXT),
-                Property(name="pageIndex", data_type=DataType.INT),
-                Property(name="chunkIndex", data_type=DataType.INT),
-                Property(name="sheetName", data_type=DataType.TEXT),
-                Property(name="text",      data_type=DataType.TEXT),
-                Property(name="image_b64", data_type=DataType.BLOB),
-                Property(name="url",       data_type=DataType.TEXT),
+                Property("text", DataType.TEXT),
+                Property("sourceId", DataType.TEXT),
+                Property("fileName", DataType.TEXT),
+                Property("fileType", DataType.TEXT),
+                Property("pageIndex", DataType.INT),
+                Property("chunkIndex", DataType.INT),
+                Property("url", DataType.TEXT),
             ],
+            vectorizer_config=Configure.Vectorizer.text2vec_google(
+                # opzionale: puoi limitare esplicitamente a "text"
+                # configuration=Configure.Text2Vec.Google(vectorize_properties=["text"])
+            ),
         )
+        print("[schema] Creata collection WindChunk (text2vec-google)")
 
 
 # =============================================================================
@@ -374,6 +370,37 @@ def run_ocr_on_image_bytes(image_bytes: bytes) -> str:
 
     text = doc.text or ""
     text = text.replace("\r\n", "\n").strip()
+    return text
+
+
+def run_ocr_on_pdf_bytes(pdf_bytes: bytes) -> str:
+    """
+    Usa Document AI per fare OCR su un PDF intero.
+    Restituisce il testo completo.
+    """
+    if not (DOCAI_PROJECT_ID and DOCAI_PROCESSOR_ID):
+        raise RuntimeError("DOCAI_PROJECT_ID / DOCAI_PROCESSOR_ID non settati")
+
+    client = documentai.DocumentProcessorServiceClient(credentials=base_creds)
+
+    name = client.processor_path(DOCAI_PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
+
+    raw_document = documentai.RawDocument(
+        content=pdf_bytes,
+        mime_type="application/pdf",
+    )
+
+    request = documentai.ProcessRequest(
+        name=name,
+        raw_document=raw_document,
+    )
+
+    print("[docai] Invio PDF a Document AI per OCR...")
+    result = client.process_document(request=request)
+    document = result.document
+
+    text = document.text or ""
+    print(f"[docai] OCR PDF completato, len={len(text)}")
     return text
 
 
@@ -589,73 +616,42 @@ def extract_native_text_by_page(pdf_bytes: bytes) -> List[str]:
 
 def ingest_pdf(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     source_id = file_meta["sourceId"]
-    file_name = file_meta["name"]
-    file_url = file_meta["url"]
-
-    print(f"[ingest_pdf] Inizio ingest PDF: {file_name} ({source_id})")
+    name = file_meta.get("name")
+    print(f"[ingest_pdf] Inizio ingest PDF: {name} ({source_id})")
 
     pdf_bytes = download_source_file(file_meta)
     print(f"[ingest_pdf] PDF scaricato, size={len(pdf_bytes)} bytes")
 
-    # 1) testo nativo con PyMuPDF
-    native_text_pages = extract_native_text_by_page(pdf_bytes)
-    print(f"[ingest_pdf] Numero pagine (testo nativo): {len(native_text_pages)}")
+    # OCR full-document con Document AI
+    full_text = run_ocr_on_pdf_bytes(pdf_bytes)
+    full_text = (full_text or "").strip()
 
-    # 2) immagini pagine con pdf2image
-    pages = convert_from_bytes(pdf_bytes, dpi=200)
-    print(f"[ingest_pdf] Immagini generate: {len(pages)}")
+    if not full_text:
+        print(f"[ingest_pdf] Nessun testo OCR per {name}, skip.")
+        return
+
+    # Chunking del testo (adatta alla tua funzione di chunking)
+    chunks = chunk_text(full_text)
+    print(f"[ingest_pdf] Numero chunk totali per {name}: {len(chunks)}")
 
     coll = client.collections.get("WindChunk")
     total_chunks = 0
 
-    for page_index, page_img in enumerate(pages, start=1):
-        native_text = ""
-        if page_index - 1 < len(native_text_pages):
-            native_text = native_text_pages[page_index - 1] or ""
+    for ci, chunk in enumerate(chunks):
+        props = {
+            "sourceId": source_id,
+            "fileName": name,
+            "fileType": "pdf",
+            "pageIndex": -1,  # non abbiamo più info per pagina; puoi lasciarlo -1 o None
+            "chunkIndex": ci,
+            "text": chunk,
+            "url": file_meta.get("url"),
+        }
 
-        if len(native_text.strip()) > 0:
-            print(f"[ingest_pdf] Pagina {page_index}: testo nativo len={len(native_text)}")
-        else:
-            print(f"[ingest_pdf] Pagina {page_index}: nessun testo nativo, uso solo OCR")
+        coll.data.insert(properties=props)
+        total_chunks += 1
 
-        # OCR con Document AI
-        img_bytes = page_img_to_bytes(page_img)
-        print(f"[ingest_pdf] Pagina {page_index}: immagine PNG size={len(img_bytes)} bytes")
-
-        ocr_text = ""
-        try:
-            ocr_text = run_ocr_on_image_bytes(img_bytes)
-            print(f"[ingest_pdf] Pagina {page_index}: OCR len={len(ocr_text)}")
-        except Exception as e:
-            print(f"[ingest_pdf][WARN] OCR fallito per pagina {page_index} di {file_name}: {repr(e)}")
-
-        combined_text = (native_text + "\n" + ocr_text).strip()
-        if not combined_text:
-            print(f"[ingest_pdf] Pagina {page_index}: nessun testo combinato, skip")
-            continue
-
-        # Chunking testo
-        chunks = chunk_text(combined_text) if combined_text else [""]
-        print(f"[ingest_pdf] Pagina {page_index}: numero chunk={len(chunks)}")
-
-        # Insert su WindChunk
-        image_b64 = base64.b64encode(img_bytes).decode("utf-8")
-        for idx, chunk in enumerate(chunks):
-            props = {
-                "sourceId":   source_id,
-                "fileName":   file_name,
-                "fileType":   "pdf",
-                "pageIndex":  page_index,
-                "chunkIndex": idx,
-                "sheetName":  "",
-                "text":       chunk,
-                "image_b64":  image_b64 if idx == 0 else None,
-                "url":        file_url,
-            }
-            coll.data.insert(properties=props)
-            total_chunks += 1
-
-    print(f"[ingest_pdf] Fine ingest PDF: {file_name}, total_chunks={total_chunks}")
+    print(f"[ingest_pdf] Fine ingest PDF: {name}, total_chunks={total_chunks}")
 
 
 def ingest_docx(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
@@ -684,9 +680,7 @@ def ingest_docx(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
             "fileType":   "docx",
             "pageIndex":  0,
             "chunkIndex": idx,
-            "sheetName":  "",
             "text":       chunk,
-            "image_b64":  None,
             "url":        file_url,
         }
         coll.data.insert(properties=props)
@@ -720,9 +714,7 @@ def ingest_txt(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
             "fileType":   "txt",
             "pageIndex":  0,
             "chunkIndex": idx,
-            "sheetName":  "",
             "text":       chunk,
-            "image_b64":  None,
             "url":        file_url,
         }
         coll.data.insert(properties=props)
@@ -739,7 +731,6 @@ def ingest_image(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     print(f"[ingest_image] Inizio ingest {file_name} ({source_id})")
 
     img_bytes = download_source_file(file_meta)
-    image_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
     ocr_text = run_ocr_on_image_bytes(img_bytes)
 
@@ -749,11 +740,9 @@ def ingest_image(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
         "sourceId":   source_id,
         "fileName":   file_name,
         "fileType":   file_type,
-        "pageIndex":  1,
+        "pageIndex":  0,
         "chunkIndex": 0,
-        "sheetName":  "",
         "text":       ocr_text,
-        "image_b64":  image_b64,
         "url":        file_url,
     }
     coll.data.insert(properties=props)
@@ -792,9 +781,7 @@ def ingest_xls(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
                 "fileType":   "xls",
                 "pageIndex":  0,
                 "chunkIndex": chunk_counter,
-                "sheetName":  sheet_name,
                 "text":       chunk,
-                "image_b64":  None,
                 "url":        file_url,
             }
             coll.data.insert(properties=props)

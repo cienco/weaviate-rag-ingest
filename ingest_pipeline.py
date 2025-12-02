@@ -25,6 +25,8 @@ from google.cloud import documentai_v1 as documentai
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
+import time
 
 
 # =============================================================================
@@ -234,6 +236,10 @@ def list_source_files() -> List[SourceFile]:
     Legge tutti i file da una cartella di Google Drive (e sotto-cartelle),
     usando GDRIVE_FOLDER_ID come root.
     """
+    if not GDRIVE_FOLDER_ID:
+        print("[source] GDRIVE_FOLDER_ID non settata: ritorno lista vuota.")
+        return []
+
     service = get_drive_service()
     root_id = GDRIVE_FOLDER_ID
     files: List[SourceFile] = []
@@ -246,11 +252,27 @@ def list_source_files() -> List[SourceFile]:
 
         page_token = None
         while True:
-            resp = service.files().list(
-                q=f"'{folder_id}' in parents and trashed = false",
-                fields="nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)",
-                pageToken=page_token,
-            ).execute()
+            # --- RETRY SULLA CHIAMATA DRIVE.files().list() ---
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    resp = service.files().list(
+                        q=f"'{folder_id}' in parents and trashed = false",
+                        fields="nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)",
+                        pageToken=page_token,
+                    ).execute()
+                    break  # ok, esco dal for
+                except HttpError as e:
+                    status = e.resp.status if e.resp else None
+                    # retry solo su errori 5xx (Internal Error, etc.)
+                    if status and 500 <= status < 600 and attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        print(f"[source] Drive 5xx (tentativo {attempt+1}/{max_retries}), retry tra {wait}s: {e}")
+                        time.sleep(wait)
+                        continue
+                    # Se non è 5xx o ho esaurito i retry, rilancio
+                    print(f"[source] ERRORE permanete da Drive: {e}")
+                    raise
 
             for item in resp.get("files", []):
                 mime = item.get("mimeType")
@@ -265,14 +287,14 @@ def list_source_files() -> List[SourceFile]:
 
                 # File "normale"
                 rel_path = f"{path_prefix}{name}"
-                last_modified = item.get("modifiedTime")  # ISO 8601 già ok per Weaviate
+                last_modified = item.get("modifiedTime")  # ISO 8601
                 url = item.get("webViewLink", "")
 
                 files.append(
                     SourceFile(
-                        id=fid,                # sourceId = fileId di Drive
+                        id=fid,
                         name=name,
-                        path=rel_path,         # path logico es: "subdir/file.pdf"
+                        path=rel_path,
                         url=url,
                         last_modified=last_modified,
                     )
@@ -688,18 +710,21 @@ def ingest_single_file(client: weaviate.WeaviateClient, file_meta: Dict[str, Any
 
 def main():
     client = get_weaviate_client()
-    create_schema_if_needed(client)
+    try:
+        create_schema_if_needed(client)
 
-    sync_source_to_fileindex(client)
-    files = list_files_to_ingest(client)
-    print(f"[main] File da ingest: {len(files)}")
+        sync_source_to_fileindex(client)
+        files = list_files_to_ingest(client)
+        print(f"[main] File da ingest: {len(files)}")
 
-    for fm in files:
-        try:
-            ingest_single_file(client, fm)
-        except Exception as e:
-            print(f"[ERROR] Ingest fallito per {fm.get('name')} ({fm.get('sourceId')}): {e}")
+        for fm in files:
+            try:
+                ingest_single_file(client, fm)
+            except Exception as e:
+                print(f"[ERROR] Ingest fallito per {fm.get('name')} ({fm.get('sourceId')}): {e}")
 
-    client.close()
-    print("[main] Ingest completato.")
+        print("[main] Ingest completato.")
+    finally:
+        client.close()
+        print("[main] Client Weaviate chiuso.")
 # placeholder ingest_pipeline.py - use content from chat

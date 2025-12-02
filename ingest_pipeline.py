@@ -389,7 +389,7 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
     src_files = list_source_files()
     seen_ids = set()
 
-    for sf in src_files:
+    for idx, sf in enumerate(src_files, start=1):
         source_id = sf.id
         seen_ids.add(source_id)
 
@@ -416,6 +416,12 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
             )
         else:
             coll.data.insert(properties=props)
+
+        # LOG OGNI 100 FILE
+        if idx % 100 == 0:
+            print(f"[sync] Processati {idx}/{len(src_files)} file da Drive")
+
+    print(f"[sync] Sync completata: {len(src_files)} file visti, {len(existing)} già esistenti")
 
     for sid, obj in existing.items():
         if sid not in seen_ids:

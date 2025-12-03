@@ -81,8 +81,8 @@ base_creds = base_creds.with_scopes(SCOPES)
 SOURCE_BASE_DIR = os.getenv("SOURCE_BASE_DIR", "/data/wind_bilance_files")
 
 # Tipi di file
-INDEXABLE_TYPES = {"pdf", "docx", "txt", "png", "tif", "xls"}
-IGNORED_TYPES = {"zip", "sql", "doc", "msg"}
+INDEXABLE_TYPES = {"pdf", "docx", "doc", "txt", "png", "tif", "xls"}
+IGNORED_TYPES = {"zip", "sql", "msg"}  # <-- tolto "doc"
 
 # Limite di caratteri per il campo text del multimodal embedding
 MAX_TEXT_CHARS = 900
@@ -444,6 +444,57 @@ def download_source_file(file_meta: Dict[str, Any]) -> bytes:
         # Se vuoi puoi loggare: print("Download %d%%" % int(status.progress() * 100))
 
     return buf.getvalue()
+
+
+def export_doc_to_pdf_via_drive(file_meta: Dict[str, Any]) -> bytes:
+    """
+    Converte un file Word .doc su Drive in PDF usando:
+      1) copy -> Google Docs
+      2) export -> PDF
+    e restituisce i bytes del PDF.
+
+    Usa lo stesso service account di get_drive_service().
+    """
+    service = get_drive_service()
+    file_id = file_meta["sourceId"]
+    name = file_meta.get("name")
+
+    print(f"[doc-export] Converto .doc in Google Docs: {name} ({file_id})")
+
+    # 1) copia come Google Docs
+    copied = service.files().copy(
+        fileId=file_id,
+        body={"mimeType": "application/vnd.google-apps.document"},
+    ).execute()
+
+    gdoc_id = copied["id"]
+    print(f"[doc-export] Creato Google Docs temporaneo: id={gdoc_id}")
+
+    try:
+        # 2) export come PDF
+        request = service.files().export_media(
+            fileId=gdoc_id,
+            mimeType="application/pdf",
+        )
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            # opzionale:
+            # if status:
+            #     print(f"[doc-export] Export PDF {int(status.progress() * 100)}%")
+
+        pdf_bytes = buf.getvalue()
+        print(f"[doc-export] Export PDF completato, size={len(pdf_bytes)} bytes")
+        return pdf_bytes
+    finally:
+        # 3) pulizia: elimina il Google Docs temporaneo
+        try:
+            service.files().delete(fileId=gdoc_id).execute()
+            print(f"[doc-export] Eliminato Google Docs temporaneo {gdoc_id}")
+        except Exception as e:
+            print(f"[doc-export] WARN: impossibile eliminare Google Docs {gdoc_id}: {e}")
 
 
 # =============================================================================
@@ -886,6 +937,47 @@ def ingest_docx(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     print(f"[ingest_docx] Fine ingest {file_name}: {len(chunks)} chunk")
 
 
+def ingest_doc(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
+    source_id = file_meta["sourceId"]
+    file_name = file_meta["name"]
+    file_url = file_meta["url"]
+
+    print(f"[ingest_doc] Inizio ingest {file_name} ({source_id})")
+
+    # 1) .doc -> Google Docs -> PDF
+    pdf_bytes = export_doc_to_pdf_via_drive(file_meta)
+
+    # 2) OCR del PDF con Document AI (come per i pdf normali)
+    full_text = run_ocr_on_pdf_bytes(pdf_bytes)
+    full_text = (full_text or "").strip()
+
+    if not full_text:
+        print(f"[ingest_doc] Nessun testo OCR per {file_name}, skip.")
+        return
+
+    # 3) Chunk testuali
+    chunks = chunk_text(full_text, max_chars=MAX_TEXT_CHARS)
+    print(f"[ingest_doc] Numero chunk totali per {file_name}: {len(chunks)}")
+
+    coll = client.collections.get("WindChunk")
+
+    for idx, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        props = {
+            "sourceId":   source_id,
+            "fileName":   file_name,
+            "fileType":   "doc",   # <-- importante per distinguere
+            "pageIndex":  -1,      # non abbiamo info precise di pagina
+            "chunkIndex": idx,
+            "text":       chunk,
+            "url":        file_url,
+        }
+        coll.data.insert(properties=props)
+
+    print(f"[ingest_doc] Fine ingest {file_name}: {len(chunks)} chunk")
+
+
 def ingest_txt(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     source_id = file_meta["sourceId"]
     file_name = file_meta["name"]
@@ -1008,6 +1100,9 @@ def ingest_single_file(client: weaviate.WeaviateClient, file_meta: Dict[str, Any
         elif file_type == "docx":
             print(f"[ingest_single_file] -> ingest_docx per {name}")
             ingest_docx(client, file_meta)
+        elif file_type == "doc":
+            print(f"[ingest_single_file] -> ingest_doc per {name}")
+            ingest_doc(client, file_meta)
         elif file_type == "txt":
             print(f"[ingest_single_file] -> ingest_txt per {name}")
             ingest_txt(client, file_meta)

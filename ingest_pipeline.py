@@ -75,8 +75,7 @@ base_creds = service_account.Credentials.from_service_account_file(
     scopes=SCOPES,
 )
 base_creds = base_creds.with_scopes(SCOPES)
-base_creds.refresh(Request())
-vertex_token = base_creds.token
+# NON refresho qui in modo fisso: lo farò dentro get_weaviate_client()
 
 # Sorgente file: cartella locale (potrà essere montata o popolata da un altro sistema)
 SOURCE_BASE_DIR = os.getenv("SOURCE_BASE_DIR", "/data/wind_bilance_files")
@@ -166,15 +165,81 @@ def chunk_text(text: str, max_chars: int = MAX_TEXT_CHARS) -> List[str]:
 # CONNESSIONE WEAVIATE + SCHEMA
 # =============================================================================
 
+def _build_vertex_headers(token: str) -> Dict[str, str]:
+    """
+    Crea gli header per far sì che Weaviate possa chiamare text2vec-google
+    usando il token OAuth2 ottenuto dalla service account.
+    """
+    headers: Dict[str, str] = {
+        "X-Goog-Vertex-Api-Key": token,
+    }
+    # opzionale: per billing/quota esplicita
+    if GCP_PROJECT_ID:
+        headers["X-Goog-User-Project"] = GCP_PROJECT_ID
+
+    return headers
+
+
 def get_weaviate_client() -> weaviate.WeaviateClient:
     """
-    Connessione a Weaviate Cloud usando SOLO l'API key del cluster.
-    Niente header Authorization custom (quello lo gestisce il client per WCS).
+    Connessione a Weaviate Cloud usando:
+    - API key del cluster (WCS_API_KEY)
+    - token OAuth2 di Vertex messo in X-Goog-Vertex-Api-Key
+
+    Questo replica il pattern del tuo MCP:
+    il token viene generato dalla service account (sa.json)
+    e passato a Weaviate come "API key" per text2vec-google.
     """
+    # 1) Refresh del token OAuth2 dalla service account
+    global base_creds
+    base_creds.refresh(Request())
+    vertex_token = base_creds.token
+
+    if not vertex_token:
+        raise RuntimeError("Impossibile ottenere il token Vertex dalla service account.")
+
+    # 2) Header HTTP per le chiamate REST del client Weaviate
+    headers = _build_vertex_headers(vertex_token)
+
+    # (facoltativo, come nel MCP: popola anche env per eventuali fallback lato client)
+    os.environ["GOOGLE_APIKEY"] = vertex_token
+    os.environ["PALM_APIKEY"] = vertex_token
+
+    print(f"[vertex-oauth] usando token Vertex (prefix={vertex_token[:10]}...)")
+
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WCS_URL,
         auth_credentials=Auth.api_key(WCS_API_KEY),
+        headers=headers,  # 👈 QUI passa il token a Weaviate
     )
+
+    # 3) Metadata gRPC (per sicurezza, come fai nel MCP)
+    try:
+        conn = getattr(client, "_connection", None)
+        if conn is not None:
+            meta_list = [
+                ("x-goog-vertex-api-key", vertex_token),
+            ]
+            if GCP_PROJECT_ID:
+                meta_list.append(("x-goog-user-project", GCP_PROJECT_ID))
+
+            # prova a settare vari modalità (come nel tuo serve.py)
+            try:
+                setattr(conn, "grpc_metadata", meta_list)
+            except Exception:
+                pass
+            try:
+                setattr(conn, "_grpc_metadata", meta_list)
+            except Exception:
+                pass
+            if hasattr(conn, "set_grpc_metadata"):
+                try:
+                    conn.set_grpc_metadata(meta_list)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[weaviate] warning: non riesco a settare gRPC metadata: {e}")
+
     return client
 
 

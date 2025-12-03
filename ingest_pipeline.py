@@ -269,15 +269,24 @@ def list_source_files() -> List[SourceFile]:
     service = get_drive_service()
     root_id = GDRIVE_FOLDER_ID
     files: List[SourceFile] = []
+    
+    print(f"[source] Inizio lettura file da Google Drive (root={root_id})...")
 
     # BFS sulle cartelle di Drive: (prefix_path, folder_id)
     queue: List[tuple[str, str]] = [("", root_id)]
+    folders_processed = 0
 
     while queue:
         path_prefix, folder_id = queue.pop(0)
-
+        folders_processed += 1
+        folder_display = path_prefix if path_prefix else "/ (root)"
+        print(f"[source] Processando cartella {folders_processed}: {folder_display} (id={folder_id})")
+        
+        page_num = 0
         page_token = None
+        
         while True:
+            page_num += 1
             # --- RETRY SULLA CHIAMATA DRIVE.files().list() ---
             max_retries = 3
             for attempt in range(max_retries):
@@ -299,8 +308,19 @@ def list_source_files() -> List[SourceFile]:
                     # Se non è 5xx o ho esaurito i retry, rilancio
                     print(f"[source] ERRORE permanete da Drive: {e}")
                     raise
+            
+            # Log quando il retry ha successo (se c'è stato un retry)
+            if attempt > 0:
+                print(f"[source] Retry riuscito per cartella {folder_display}, pagina {page_num}")
+            
+            items = resp.get("files", [])
+            files_in_page = len(items)
+            folders_in_page = sum(1 for item in items if item.get("mimeType") == "application/vnd.google-apps.folder")
+            files_in_page_count = files_in_page - folders_in_page
+            
+            print(f"[source] Cartella {folder_display}, pagina {page_num}: {files_in_page_count} file, {folders_in_page} sottocartelle")
 
-            for item in resp.get("files", []):
+            for item in items:
                 mime = item.get("mimeType")
                 fid = item["id"]
                 name = item["name"]
@@ -325,12 +345,17 @@ def list_source_files() -> List[SourceFile]:
                         last_modified=last_modified,
                     )
                 )
+                
+                # Log progress ogni 100 file
+                if len(files) % 100 == 0:
+                    print(f"[source] File trovati finora: {len(files)} (cartella corrente: {folder_display})")
 
             page_token = resp.get("nextPageToken")
             if not page_token:
+                print(f"[source] Completata cartella {folder_display}: {len(files)} file totali finora")
                 break
 
-    print(f"[source] Trovati {len(files)} file in Google Drive (root={root_id})")
+    print(f"[source] Trovati {len(files)} file in Google Drive (root={root_id}, {folders_processed} cartelle processate)")
     return files
 
 
@@ -540,8 +565,15 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
     # 2) File da sorgente (Google Drive)
     src_files = list_source_files()
     print(f"[sync] File trovati in Drive: {len(src_files)}")
+    
+    print(f"[sync] Inizio sincronizzazione: {len(src_files)} file da processare...")
+    print(f"[sync] File esistenti in Weaviate: {len(existing_by_source)}")
+    print(f"[sync] Stimati nuovi file: ~{len(src_files) - len(existing_by_source)}")
 
     seen_ids: set[str] = set()
+    updates_count = 0
+    inserts_count = 0
+    start_time = time.time()
 
     for idx, sf in enumerate(src_files, start=1):
         source_id = sf.id
@@ -566,16 +598,44 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
 
         if source_id in existing_by_source:
             # UPDATE idempotente
-            coll.data.update(
-                uuid=existing_by_source[source_id].uuid,
-                properties=props,
-            )
+            try:
+                coll.data.update(
+                    uuid=existing_by_source[source_id].uuid,
+                    properties=props,
+                )
+                updates_count += 1
+            except Exception as e:
+                print(f"[sync] ERRORE update per {sf.name} ({source_id}): {e}")
+                raise
         else:
             # INSERT solo se non esiste già
-            coll.data.insert(properties=props)
+            try:
+                coll.data.insert(properties=props)
+                inserts_count += 1
+            except Exception as e:
+                print(f"[sync] ERRORE insert per {sf.name} ({source_id}): {e}")
+                raise
 
+        # Log più frequente: ogni 10 file invece di 100
+        if idx % 10 == 0:
+            elapsed = time.time() - start_time
+            rate = idx / elapsed if elapsed > 0 else 0
+            remaining = (len(src_files) - idx) / rate if rate > 0 else 0
+            print(f"[sync] Progress: {idx}/{len(src_files)} file "
+                  f"(updates: {updates_count}, inserts: {inserts_count}, "
+                  f"rate: {rate:.1f} file/s, ETA: {remaining:.0f}s)")
+
+        # Log ogni 100 file con più dettagli
         if idx % 100 == 0:
-            print(f"[sync] Processati {idx}/{len(src_files)} file da Drive")
+            elapsed = time.time() - start_time
+            rate = idx / elapsed if elapsed > 0 else 0
+            print(f"[sync] Processati {idx}/{len(src_files)} file da Drive "
+                  f"(updates: {updates_count}, inserts: {inserts_count}, "
+                  f"tempo: {elapsed:.1f}s, rate: {rate:.2f} file/s)")
+
+    elapsed_total = time.time() - start_time
+    print(f"[sync] Completata sincronizzazione: {updates_count} updates, {inserts_count} inserts, "
+          f"tempo totale: {elapsed_total:.1f}s")
 
     # 3) (opzionale ma utile) marca come deleted quelli non più visti
     for sid, obj in existing_by_source.items():

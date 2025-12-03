@@ -1049,35 +1049,68 @@ def main():
         files = list_files_to_ingest(client)
         print(f"[main] File da ingest (prima del limite): {len(files)}")
 
-        # Limite per run per non sforare memoria
-        max_files_str = os.getenv("INGEST_MAX_FILES_PER_RUN", "5")  # es: 5
+        # Limiti da env
+        max_files_str = os.getenv("INGEST_MAX_FILES_PER_RUN", "10")
+        max_pdfs_str = os.getenv("INGEST_MAX_PDFS_PER_RUN", "3")
+
         try:
             max_files = int(max_files_str)
         except ValueError:
-            max_files = 5
+            max_files = 10
 
-        if len(files) > max_files:
-            print(f"[main] Limito ingest a {max_files} file per run (su {len(files)} candidati)")
-            files = files[:max_files]
+        try:
+            max_pdfs = int(max_pdfs_str)
+        except ValueError:
+            max_pdfs = 3
 
-        print(f"[main] File da ingest effettivi in questo run: {len(files)}")
+        print(f"[main] Limiti configurati: max_files={max_files}, max_pdfs={max_pdfs}")
+
+        # Selezione file rispettando i limiti
+        selected: List[Dict[str, Any]] = []
+        pdf_count = 0
+
+        for fm in files:
+            if len(selected) >= max_files:
+                break
+
+            ftype = (fm.get("fileType") or "").lower()
+
+            if ftype == "pdf":
+                if pdf_count >= max_pdfs:
+                    # abbiamo già processato troppi pdf in questo run
+                    continue
+                pdf_count += 1
+
+            selected.append(fm)
+
+        print(
+            f"[main] File da ingest effettivi in questo run: {len(selected)} "
+            f"(di cui pdf={pdf_count})"
+        )
 
         # Esecuzione ingest
-        for idx, fm in enumerate(files, start=1):
+        for idx, fm in enumerate(selected, start=1):
             name = fm.get("name")
             source_id = fm.get("sourceId")
             ftype = fm.get("fileType")
-            print(f"[main] >>> [{idx}/{len(files)}] Inizio ingest file: name={name}, type={ftype}, sourceId={source_id}")
+            print(
+                f"[main] >>> [{idx}/{len(selected)}] Inizio ingest file: "
+                f"name={name}, type={ftype}, sourceId={source_id}"
+            )
 
             try:
                 ingest_single_file(client, fm)
-                print(f"[main] <<< [{idx}/{len(files)}] Ingest COMPLETATA per: {name}")
+                print(
+                    f"[main] <<< [{idx}/{len(selected)}] "
+                    f"Ingest COMPLETATA per: {name}"
+                )
             except Exception as e:
-                print(f"[main][ERROR] Ingest FALLITA per {name} ({source_id}): {repr(e)}")
+                print(
+                    f"[main][ERROR] Ingest FALLITA per {name} ({source_id}): {repr(e)}"
+                )
 
         print(f"[main] Run ingest {run_id} completato.")
     finally:
         client.close()
         print("[main] Client Weaviate chiuso.")
         print(f"[main] ===== Fine run ingest {run_id} =====")
-# placeholder ingest_pipeline.py - use content from chat

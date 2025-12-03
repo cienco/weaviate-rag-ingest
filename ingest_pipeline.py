@@ -54,7 +54,8 @@ if not DOCAI_PROCESSOR_ID:
 # Scopes per Document AI + Drive
 SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/drive.readonly",
+    # serve anche scrittura per poter fare `files().copy()` sui .doc
+    "https://www.googleapis.com/auth/drive",
 ]
 
 # Percorso del file JSON della service account

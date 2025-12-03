@@ -410,8 +410,16 @@ def split_pdf_bytes(pdf_bytes: bytes, max_pages: int) -> tuple[list[bytes], int]
         new_doc = fitz.open()
         # inseriamo le pagine [start, end-1]
         new_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
-        chunk_bytes = new_doc.tobytes("pdf")
+        
+        # Usa save() su BytesIO invece di tobytes("pdf")
+        chunk_buffer = io.BytesIO()
+        new_doc.save(chunk_buffer, garbage=4, deflate=True)
+        chunk_bytes = chunk_buffer.getvalue()
+        new_doc.close()
+        
         chunks.append(chunk_bytes)
+    
+    doc.close()
 
     return chunks, num_pages
 

@@ -177,7 +177,21 @@ def get_weaviate_client() -> weaviate.WeaviateClient:
 
 
 def create_schema_if_needed(client: weaviate.WeaviateClient):
-    existing = {c.name for c in client.collections.list_all()}
+    existing_raw = client.collections.list_all()
+
+    existing: set[str] = set()
+    for c in existing_raw:
+        # caso client nuovo: c è un oggetto con .name
+        if hasattr(c, "name"):
+            existing.add(c.name)
+        # caso client vecchio: c è già una stringa
+        elif isinstance(c, str):
+            existing.add(c)
+        else:
+            # fallback per sicurezza
+            existing.add(str(c))
+
+    print(f"[schema] Collection esistenti: {existing}")
 
     # FileIndexStatus (metadati, non vettoriale)
     if "FileIndexStatus" not in existing:

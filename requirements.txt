@@ -3,6 +3,7 @@ pdf2image
 pymupdf
 python-docx
 pandas
+xlrd>=2.0.1
 openpyxl
 google-cloud-documentai
 google-auth

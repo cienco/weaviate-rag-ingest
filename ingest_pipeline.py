@@ -13,7 +13,6 @@ from weaviate.classes.config import (
 )
 from weaviate.classes.query import Filter
 
-from pdf2image import convert_from_bytes
 import fitz  # pymupdf
 import docx  # python-docx
 import pandas as pd
@@ -459,7 +458,7 @@ def run_ocr_on_pdf_bytes(pdf_bytes: bytes) -> str:
     if not (DOCAI_PROJECT_ID and DOCAI_PROCESSOR_ID):
         raise RuntimeError("DOCAI_PROJECT_ID / DOCAI_PROCESSOR_ID non settati")
 
-    client = documentai.DocumentProcessorServiceClient(credentials=base_creds)
+    client = get_docai_client()
 
     # Spezza il PDF in chunk di max N pagine
     chunks_bytes, num_pages = split_pdf_bytes(pdf_bytes, DOC_PAGES_LIMIT_NON_IMAGELESS)
@@ -897,7 +896,7 @@ def ingest_xls(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
     chunk_counter = 0
 
     for sheet_name, df in sheets.items():
-        text_repr = df.to_csv(index=False, sep=";", line_terminator="\n")
+        text_repr = df.to_csv(index=False, sep=";", lineterminator="\n")
         text = f"Sheet: {sheet_name}\n{text_repr}"
 
         chunks = chunk_text(text)

@@ -339,12 +339,14 @@ def list_source_files() -> List[SourceFile]:
     # BFS sulle cartelle di Drive: (prefix_path, folder_id)
     queue: List[tuple[str, str]] = [("", root_id)]
     folders_processed = 0
+    
+    # Progress logging basato su tempo (ogni 10 secondi)
+    last_progress_log = time.time()
+    PROGRESS_LOG_INTERVAL = 10  # secondi
 
     while queue:
         path_prefix, folder_id = queue.pop(0)
         folders_processed += 1
-        folder_display = path_prefix if path_prefix else "/ (root)"
-        print(f"[source] Processando cartella {folders_processed}: {folder_display} (id={folder_id})")
         
         page_num = 0
         page_token = None
@@ -375,14 +377,12 @@ def list_source_files() -> List[SourceFile]:
             
             # Log quando il retry ha successo (se c'è stato un retry)
             if attempt > 0:
-                print(f"[source] Retry riuscito per cartella {folder_display}, pagina {page_num}")
+                print(f"[source] Retry riuscito (cartella #{folders_processed})")
             
             items = resp.get("files", [])
             files_in_page = len(items)
             folders_in_page = sum(1 for item in items if item.get("mimeType") == "application/vnd.google-apps.folder")
             files_in_page_count = files_in_page - folders_in_page
-            
-            print(f"[source] Cartella {folder_display}, pagina {page_num}: {files_in_page_count} file, {folders_in_page} sottocartelle")
 
             for item in items:
                 mime = item.get("mimeType")
@@ -409,15 +409,19 @@ def list_source_files() -> List[SourceFile]:
                         last_modified=last_modified,
                     )
                 )
-                
-                # Log progress ogni 100 file
-                if len(files) % 100 == 0:
-                    print(f"[source] File trovati finora: {len(files)} (cartella corrente: {folder_display})")
 
             page_token = resp.get("nextPageToken")
             if not page_token:
-                print(f"[source] Completata cartella {folder_display}: {len(files)} file totali finora")
                 break
+        
+        # Log progress periodico (ogni 10 secondi)
+        current_time = time.time()
+        if current_time - last_progress_log >= PROGRESS_LOG_INTERVAL:
+            print(
+                f"[source] Progress: {folders_processed} cartelle processate, "
+                f"{len(files)} file trovati, {len(queue)} cartelle in coda"
+            )
+            last_progress_log = current_time
 
     print(f"[source] Trovati {len(files)} file in Google Drive (root={root_id}, {folders_processed} cartelle processate)")
     return files

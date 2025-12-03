@@ -204,6 +204,9 @@ def create_schema_if_needed(client: weaviate.WeaviateClient):
 
     # WindChunk: SOLO TESTO, text2vec-google
     if "WindChunk" not in existing:
+        if not GCP_PROJECT_ID:
+            raise RuntimeError("GCP_PROJECT_ID non è settata: serve per text2vec-google.")
+
         client.collections.create(
             name="WindChunk",
             properties=[
@@ -215,7 +218,11 @@ def create_schema_if_needed(client: weaviate.WeaviateClient):
                 Property(name="chunkIndex", data_type=DataType.INT),
                 Property(name="url", data_type=DataType.TEXT),
             ],
-            vectorizer_config=Configure.Vectorizer.text2vec_google(),
+            vectorizer_config=Configure.Vectorizer.text2vec_google(
+                project_id=GCP_PROJECT_ID,
+                # opzionale: puoi specificare il modello, se la tua versione lo supporta:
+                # model="textembedding-gecko@003",
+            ),
         )
         print("[schema] Creata collection WindChunk (text2vec-google)")
 

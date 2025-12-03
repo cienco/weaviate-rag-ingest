@@ -716,17 +716,29 @@ def sync_source_to_fileindex(client: weaviate.WeaviateClient):
         else:
             props["note"] = ""
 
-        if source_id in existing_by_source:
-            # UPDATE idempotente
-            try:
-                coll.data.update(
-                    uuid=existing_by_source[source_id].uuid,
-                    properties=props,
-                )
-                updates_count += 1
-            except Exception as e:
-                print(f"[sync] ERRORE update per {sf.name} ({source_id}): {e}")
-                raise
+        existing_obj = existing_by_source.get(source_id)
+
+        if existing_obj:
+            current = existing_obj.properties or {}
+
+            # 🔍 controlla se qualcosa è cambiato davvero
+            changed = False
+            for k, v in props.items():
+                if current.get(k) != v:
+                    changed = True
+                    break
+
+            if changed:
+                try:
+                    coll.data.update(
+                        uuid=existing_obj.uuid,
+                        properties=props,
+                    )
+                    updates_count += 1
+                except Exception as e:
+                    print(f"[sync] ERRORE update per {sf.name} ({source_id}): {e}")
+                    raise
+            # else: niente update, è già identico
         else:
             # INSERT solo se non esiste già
             try:

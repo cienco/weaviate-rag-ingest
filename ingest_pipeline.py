@@ -89,6 +89,9 @@ IGNORED_TYPES = {"zip", "sql", "doc", "msg"}
 # Limite di caratteri per il campo text del multimodal embedding
 MAX_TEXT_CHARS = 900
 
+# Limite pagine per Document AI non-imageless mode
+DOC_PAGES_LIMIT_NON_IMAGELESS = 15
+
 
 # =============================================================================
 # GOOGLE DRIVE CONFIG
@@ -392,35 +395,75 @@ def run_ocr_on_image_bytes(image_bytes: bytes) -> str:
     return text
 
 
+def split_pdf_bytes(pdf_bytes: bytes, max_pages: int) -> tuple[list[bytes], int]:
+    """
+    Spezza un PDF (in bytes) in più PDF, ognuno con al massimo max_pages pagine.
+    Restituisce (lista_pdf_chunk_bytes, numero_pagine_totale).
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    num_pages = doc.page_count
+
+    chunks: list[bytes] = []
+
+    for start in range(0, num_pages, max_pages):
+        end = min(start + max_pages, num_pages)  # end esclusivo
+        new_doc = fitz.open()
+        # inseriamo le pagine [start, end-1]
+        new_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
+        chunk_bytes = new_doc.tobytes("pdf")
+        chunks.append(chunk_bytes)
+
+    return chunks, num_pages
+
+
 def run_ocr_on_pdf_bytes(pdf_bytes: bytes) -> str:
     """
-    Usa Document AI per fare OCR su un PDF intero.
-    Restituisce il testo completo.
+    OCR di un PDF intero usando Document AI in modalità *non-imageless* (quella "ricca").
+    - Se il PDF ha <= DOC_PAGES_LIMIT_NON_IMAGELESS pagine -> una sola chiamata
+    - Se ha più pagine -> viene spezzato in chunk e chiamato più volte.
+    Restituisce il testo concatenato.
     """
     if not (DOCAI_PROJECT_ID and DOCAI_PROCESSOR_ID):
         raise RuntimeError("DOCAI_PROJECT_ID / DOCAI_PROCESSOR_ID non settati")
 
     client = documentai.DocumentProcessorServiceClient(credentials=base_creds)
 
-    name = client.processor_path(DOCAI_PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
-
-    raw_document = documentai.RawDocument(
-        content=pdf_bytes,
-        mime_type="application/pdf",
+    # Spezza il PDF in chunk di max N pagine
+    chunks_bytes, num_pages = split_pdf_bytes(pdf_bytes, DOC_PAGES_LIMIT_NON_IMAGELESS)
+    print(
+        f"[docai] PDF ha {num_pages} pagine, verrà spezzato in "
+        f"{len(chunks_bytes)} chunk da max {DOC_PAGES_LIMIT_NON_IMAGELESS} pagine (non-imageless)."
     )
 
-    request = documentai.ProcessRequest(
-        name=name,
-        raw_document=raw_document,
-    )
+    full_text_parts: list[str] = []
 
-    print("[docai] Invio PDF a Document AI per OCR...")
-    result = client.process_document(request=request)
-    document = result.document
+    for idx, chunk in enumerate(chunks_bytes, start=1):
+        name = client.processor_path(DOCAI_PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
 
-    text = document.text or ""
-    print(f"[docai] OCR PDF completato, len={len(text)}")
-    return text
+        raw_document = documentai.RawDocument(
+            content=chunk,
+            mime_type="application/pdf",
+        )
+
+        # NOTA: niente process_options.enable_image_extraction=False:
+        # restiamo in non-imageless mode, così Document AI lavora "full".
+        request = documentai.ProcessRequest(
+            name=name,
+            raw_document=raw_document,
+        )
+
+        print(f"[docai] Invio chunk {idx}/{len(chunks_bytes)} a Document AI (non-imageless)...")
+        result = client.process_document(request=request)
+        document = result.document
+
+        text = (document.text or "").strip()
+        print(f"[docai] Chunk {idx}/{len(chunks_bytes)} OCR completato, len={len(text)}")
+        if text:
+            full_text_parts.append(text)
+
+    full_text = "\n\n".join(full_text_parts).strip()
+    print(f"[docai] OCR PDF COMPLETO: len={len(full_text)}")
+    return full_text
 
 
 # =============================================================================
@@ -650,7 +693,7 @@ def ingest_pdf(client: weaviate.WeaviateClient, file_meta: Dict[str, Any]):
         return
 
     # Chunking del testo (adatta alla tua funzione di chunking)
-    chunks = chunk_text(full_text)
+    chunks = chunk_text(full_text, max_chars=900)
     print(f"[ingest_pdf] Numero chunk totali per {name}: {len(chunks)}")
 
     coll = client.collections.get("WindChunk")

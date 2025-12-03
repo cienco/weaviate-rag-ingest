@@ -177,9 +177,6 @@ def get_weaviate_client() -> weaviate.WeaviateClient:
 
 
 def create_schema_if_needed(client: weaviate.WeaviateClient):
-    """
-    Crea le collection FileIndexStatus e WindChunk se non esistono.
-    """
     existing = {c.name for c in client.collections.list_all()}
 
     # FileIndexStatus (metadati, non vettoriale)
@@ -187,17 +184,21 @@ def create_schema_if_needed(client: weaviate.WeaviateClient):
         client.collections.create(
             name="FileIndexStatus",
             properties=[
-                Property("sourceId", DataType.TEXT, description="ID sorgente (es: fileId Drive)"),
-                Property("name", DataType.TEXT),
-                Property("path", DataType.TEXT),
-                Property("url", DataType.TEXT),
-                Property("fileType", DataType.TEXT),
-                Property("lastModified", DataType.TEXT),
-                Property("indexedAt", DataType.TEXT),
-                Property("isDeleted", DataType.BOOL),
-                Property("note", DataType.TEXT),
+                Property(
+                    name="sourceId",
+                    data_type=DataType.TEXT,
+                    description="ID sorgente (es: fileId Drive)",
+                ),
+                Property(name="name", data_type=DataType.TEXT),
+                Property(name="path", data_type=DataType.TEXT),
+                Property(name="url", data_type=DataType.TEXT),
+                Property(name="fileType", data_type=DataType.TEXT),
+                Property(name="lastModified", data_type=DataType.TEXT),
+                Property(name="indexedAt", data_type=DataType.TEXT),
+                Property(name="isDeleted", data_type=DataType.BOOL),
+                Property(name="note", data_type=DataType.TEXT),
             ],
-            vectorizer_config=Configure.Vectorizer.none(),  # niente embedding
+            vectorizer_config=Configure.Vectorizer.none(),  # niente embedding su questa collection
         )
         print("[schema] Creata collection FileIndexStatus")
 
@@ -206,18 +207,15 @@ def create_schema_if_needed(client: weaviate.WeaviateClient):
         client.collections.create(
             name="WindChunk",
             properties=[
-                Property("text", DataType.TEXT),
-                Property("sourceId", DataType.TEXT),
-                Property("fileName", DataType.TEXT),
-                Property("fileType", DataType.TEXT),
-                Property("pageIndex", DataType.INT),
-                Property("chunkIndex", DataType.INT),
-                Property("url", DataType.TEXT),
+                Property(name="text", data_type=DataType.TEXT),
+                Property(name="sourceId", data_type=DataType.TEXT),
+                Property(name="fileName", data_type=DataType.TEXT),
+                Property(name="fileType", data_type=DataType.TEXT),
+                Property(name="pageIndex", data_type=DataType.INT),
+                Property(name="chunkIndex", data_type=DataType.INT),
+                Property(name="url", data_type=DataType.TEXT),
             ],
-            vectorizer_config=Configure.Vectorizer.text2vec_google(
-                # opzionale: puoi limitare esplicitamente a "text"
-                # configuration=Configure.Text2Vec.Google(vectorize_properties=["text"])
-            ),
+            vectorizer_config=Configure.Vectorizer.text2vec_google(),
         )
         print("[schema] Creata collection WindChunk (text2vec-google)")
 

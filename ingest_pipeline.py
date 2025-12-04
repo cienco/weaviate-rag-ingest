@@ -82,7 +82,8 @@ base_creds = base_creds.with_scopes(SCOPES)
 SOURCE_BASE_DIR = os.getenv("SOURCE_BASE_DIR", "/data/wind_bilance_files")
 
 # Tipi di file
-INDEXABLE_TYPES = {"pdf", "docx", "doc", "txt", "png", "tif", "xls"}
+INDEXABLE_TYPES = {"pdf", "docx", "txt", "png", "tif", "xls"}
+# i .doc NON sono più indicizzabili per ora
 IGNORED_TYPES = {"zip", "sql", "msg"}  # <-- tolto "doc"
 
 # Limite di caratteri per il campo text del multimodal embedding
